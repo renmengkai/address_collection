@@ -56,7 +56,7 @@ sha3 = "0.10"
 
 [[bin]]
 name = "convert_keys"
-path = "convert_keys.rs"
+path = "src/convert_keys.rs"
 
 [profile.release]
 lto = true
