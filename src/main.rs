@@ -1,5 +1,6 @@
 mod address;
 mod blockchain;
+mod cache;
 mod cli;
 mod config;
 mod error;

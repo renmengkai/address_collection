@@ -54,6 +54,9 @@ url = "2.4"
 # 用于keccak256哈希计算
 sha3 = "0.10"
 
+# 缓存
+moka = { version = "0.12", features = ["future"] }
+
 [[bin]]
 name = "convert_keys"
 path = "src/convert_keys.rs"

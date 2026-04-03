@@ -84,16 +84,23 @@ impl EthereumClient {
             .map_err(|_| BlockchainError::TimeoutError("Timeout getting latest block".to_string()))?
             .map_err(|e| BlockchainError::RpcConnection(format!("Failed to get latest block: {}", e)))?;
 
+        // 判断是否为热门链，限制扫描范围
+        let is_popular_chain = matches!(self.chain_name.to_lowercase().as_str(), "ethereum" | "base");
+        let max_scan_blocks = if is_popular_chain { 100 } else { 1000 };
+
         // 从最新的区块开始向前搜索，查找该地址的交易
         let mut current_block = latest_block;
-        let start_block = if latest_block > 1000u64.into() {
-            latest_block - U64::from(1000u64)
+        let start_block = if latest_block > max_scan_blocks.into() {
+            latest_block - U64::from(max_scan_blocks as u64)
         } else {
             0u64.into()
         };
 
+        tracing::debug!("[{}] Scanning last {} blocks for transaction of {}",
+            self.chain_name, max_scan_blocks, address);
+
         while current_block >= start_block {
-            let block = timeout(Duration::from_secs(30), self.provider.get_block_with_txs(current_block))
+            let block = timeout(Duration::from_secs(10), self.provider.get_block_with_txs(current_block))
                 .await
                 .map_err(|_| BlockchainError::TimeoutError("Timeout getting block".to_string()))?
                 .map_err(|e| BlockchainError::RpcConnection(format!("Failed to get block: {}", e)))?;
@@ -124,39 +131,114 @@ impl EthereumClient {
         Ok(None)
     }
 
-    /// 降级方案：使用标准 RPC 获取最后一笔交易
+    /// 降级方案：使用 Ankr API 分页查询历史交易
+    /// 通过分页查询追溯直到找到最后一笔交易（支持查询多年数据）
+    /// 限制：最多只查询1年，减少API调用
     async fn get_last_transaction_fallback(&self, address: &str) -> Result<Option<TransactionInfo>> {
+        tracing::info!("[{}] Trying Ankr API paginated fallback for {}", self.chain_name, address);
+
+        // 使用分页查询追溯历史交易，最多查询1年（减少API调用）
+        // 如果1年内没有交易，说明地址可能不活跃
+        match self.enhanced_rpc.get_last_transaction_ankr_paginated(
+            address,
+            &self.multichain_url,
+            &self.chain_name,
+            1, // 限制为1年，减少API调用
+        ).await {
+            Ok(Some((timestamp, hash, block_number))) => {
+                tracing::info!("[{}] Ankr API paginated fallback succeeded for {}: found tx at block {}",
+                    self.chain_name, address, block_number);
+                return Ok(Some(TransactionInfo {
+                    timestamp,
+                    hash,
+                    block_number,
+                }));
+            }
+            Ok(None) => {
+                tracing::warn!("[{}] Ankr API paginated fallback returned no transactions for {} (address may have no recent transactions)",
+                    self.chain_name, address);
+            }
+            Err(e) => {
+                tracing::warn!("[{}] Ankr API paginated fallback failed for {}: {}",
+                    self.chain_name, address, e);
+            }
+        }
+
+        // 不再扫描区块，因为区块扫描会发起大量API请求
+        // 如果分页查询失败，直接返回None
+        tracing::info!("[{}] Skipping block scanning for {} to reduce API calls", self.chain_name, address);
+        Ok(None)
+    }
+
+    /// 通过扫描区块获取最后一笔交易（仅用于极端情况）
+    #[allow(dead_code)]
+    async fn get_last_transaction_by_scanning(&self, address: &str) -> Result<Option<TransactionInfo>> {
         let eth_address = Address::from_str(address)
             .map_err(|e| BlockchainError::InvalidAddress(format!("Invalid address: {}", e)))?;
 
-        // 从最新区块向回查找最多 50 个区块（减少查询量）
-        let latest_block = self.provider.get_block_number().await
+        // 获取最新区块号
+        let latest_block = timeout(
+            Duration::from_secs(10),
+            self.provider.get_block_number()
+        ).await
+            .map_err(|_| BlockchainError::TimeoutError("Timeout getting block number".to_string()))?
             .map_err(|e| BlockchainError::RpcConnection(format!("Failed to get block number: {}", e)))?;
 
-        let start_block = latest_block.as_u64().saturating_sub(50);
+        // 根据链类型设置不同的扫描范围
+        // 热门链区块产生快，扫描更多区块；其他链扫描适中范围
+        let scan_blocks = match self.chain_name.to_lowercase().as_str() {
+            "ethereum" => 5000,   // 约17小时（12秒/区块）
+            "base" => 5000,       // 约2小时（2秒/区块）
+            "polygon" => 10000,   // 约5小时（2秒/区块）
+            "bsc" | "bnb" => 5000, // 约4小时（3秒/区块）
+            "arbitrum" => 50000,  // 约14小时（1秒/区块）
+            "optimism" => 50000,  // 约14小时（1秒/区块）
+            "avalanche" => 5000,  // 约7小时（5秒/区块）
+            _ => 2000,            // 其他链默认扫描2000个区块
+        };
 
-        // 查找最近的交易（从最新到最旧）
+        let start_block = latest_block.as_u64().saturating_sub(scan_blocks);
+
+        tracing::info!("[{}] Block scanning {} blocks ({} to {}) for {}",
+            self.chain_name, scan_blocks, start_block, latest_block, address);
+
         for block_num in (start_block..=latest_block.as_u64()).rev() {
-            if let Ok(Some(block)) = self.provider.get_block_with_txs(block_num).await {
-                // 检查该区块中是否有该地址的交易
-                for tx in block.transactions.iter().rev() {
-                    if tx.from == eth_address || tx.to == Some(eth_address) {
-                        // 找到最后一笔交易
-                        let timestamp = Utc.timestamp_opt(block.timestamp.as_u64() as i64, 0)
-                            .single()
-                            .ok_or_else(|| BlockchainError::RpcConnection("Invalid timestamp".to_string()))?;
+            match timeout(
+                Duration::from_secs(5),
+                self.provider.get_block_with_txs(block_num)
+            ).await {
+                Ok(Ok(Some(block))) => {
+                    for tx in block.transactions.iter().rev() {
+                        if tx.from == eth_address || tx.to == Some(eth_address) {
+                            let timestamp = Utc.timestamp_opt(block.timestamp.as_u64() as i64, 0)
+                                .single()
+                                .ok_or_else(|| BlockchainError::RpcConnection("Invalid timestamp".to_string()))?;
 
-                        return Ok(Some(TransactionInfo {
-                            timestamp,
-                            hash: format!("{:x}", tx.hash),
-                            block_number: block_num,
-                        }));
+                            tracing::info!("[{}] Found transaction in block {} for {}",
+                                self.chain_name, block_num, address);
+
+                            return Ok(Some(TransactionInfo {
+                                timestamp,
+                                hash: format!("{:x}", tx.hash),
+                                block_number: block_num,
+                            }));
+                        }
                     }
+                }
+                Ok(Ok(None)) => continue,
+                Ok(Err(e)) => {
+                    tracing::debug!("[{}] Error getting block {}: {}", self.chain_name, block_num, e);
+                    continue;
+                }
+                Err(_) => {
+                    tracing::debug!("[{}] Timeout getting block {}", self.chain_name, block_num);
+                    continue;
                 }
             }
         }
 
-        // 在最近 50 个区块中没找到
+        tracing::warn!("[{}] No transaction found in last {} blocks for {} (tx_count > 0 but no tx found)",
+            self.chain_name, scan_blocks, address);
         Ok(None)
     }
 }
@@ -176,34 +258,47 @@ impl BlockchainClient for EthereumClient {
 
         tracing::debug!("[{}] Querying address {}", self.chain_name, address_str);
 
-        // 并发执行：余额、交易数量、最后交易时间（3个请求同时进行）
+        // 先查询交易数量（最轻量的请求）
+        let tx_count = timeout(Duration::from_secs(30), self.provider.get_transaction_count(eth_address, None))
+            .await
+            .map_err(|_| BlockchainError::TimeoutError("Timeout getting transaction count".to_string()))?
+            .map_err(|e| BlockchainError::RpcConnection(format!("Failed to get transaction count: {}", e)))?;
+
+        tracing::debug!("[{}] {} - tx_count={}", self.chain_name, address_str, tx_count);
+
+        // 如果没有交易，直接返回结果，跳过所有昂贵的API调用
+        if tx_count.as_u64() == 0 {
+            tracing::info!("[{}] {} - No transactions, skipping balance and tx query", self.chain_name, address_str);
+            return Ok(AddressInfo {
+                address: address_str,
+                balance: Some("0".to_string()),
+                transaction_count: 0,
+                last_transaction: None,
+            });
+        }
+
+        // 有交易时才查询余额和最后交易
         let balance_future = timeout(Duration::from_secs(30), self.provider.get_balance(eth_address, None));
-        let tx_count_future = timeout(Duration::from_secs(30), self.provider.get_transaction_count(eth_address, None));
         let last_tx_future = self.enhanced_rpc.get_last_transaction_ankr(
             &address_with_prefix,
             &self.multichain_url,
             &self.chain_name
         );
 
-        tracing::debug!("[{}] {} - Waiting for balance, tx_count, last_tx...", self.chain_name, address_str);
+        tracing::debug!("[{}] {} - Waiting for balance, last_tx...", self.chain_name, address_str);
 
-        let (balance_result, tx_count_result, last_tx_result) = tokio::join!(
+        let (balance_result, last_tx_result) = tokio::join!(
             balance_future,
-            tx_count_future,
             last_tx_future
         );
 
-        tracing::debug!("[{}] {} - All 3 requests completed", self.chain_name, address_str);
+        tracing::debug!("[{}] {} - Balance and tx requests completed", self.chain_name, address_str);
 
         let balance = balance_result
             .map_err(|_| BlockchainError::TimeoutError("Timeout getting balance".to_string()))?
             .map_err(|e| BlockchainError::RpcConnection(format!("Failed to get balance: {}", e)))?;
 
-        let tx_count = tx_count_result
-            .map_err(|_| BlockchainError::TimeoutError("Timeout getting transaction count".to_string()))?
-            .map_err(|e| BlockchainError::RpcConnection(format!("Failed to get transaction count: {}", e)))?;
-
-        tracing::debug!("[{}] {} - balance={}, tx_count={}", self.chain_name, address_str, balance, tx_count);
+        tracing::debug!("[{}] {} - balance={}", self.chain_name, address_str, balance);
 
         // 处理交易时间查询结果
         let last_transaction = match last_tx_result {
@@ -217,13 +312,11 @@ impl BlockchainClient for EthereumClient {
                 })
             }
             Ok(None) => {
-                // Ankr API 返回空，zksync 直接返回 None，其他链尝试回退
                 tracing::debug!("Ankr API returned no transactions for {} on {}", address_str, self.chain_name);
 
-                // 如果是 zksync，不尝试回退（回退方案对 zksync 很慢且不可靠）
                 if self.chain_name.to_lowercase() == "zksync" {
                     None
-                } else if tx_count.as_u64() > 0 {
+                } else {
                     match self.get_last_transaction_fallback(&address_with_prefix).await {
                         Ok(Some(tx_info)) => {
                             tracing::info!("Fallback succeeded for {} on {}", address_str, self.chain_name);
@@ -239,19 +332,15 @@ impl BlockchainClient for EthereumClient {
                             None
                         }
                     }
-                } else {
-                    tracing::info!("No transactions found for {} on {}", address_str, self.chain_name);
-                    None
                 }
             }
             Err(e) => {
                 tracing::warn!("Failed to get last transaction for {} on {}: {}",
                     address_str, self.chain_name, e);
 
-                // 如果是 zksync，直接返回 None（Ankr 不稳定，回退太慢）
                 if self.chain_name.to_lowercase() == "zksync" {
                     None
-                } else if tx_count.as_u64() > 0 {
+                } else {
                     match self.get_last_transaction_fallback(&address_with_prefix).await {
                         Ok(Some(tx_info)) => {
                             tracing::info!("Fallback succeeded after Ankr error for {} on {}", address_str, self.chain_name);
@@ -259,8 +348,6 @@ impl BlockchainClient for EthereumClient {
                         }
                         _ => None
                     }
-                } else {
-                    None
                 }
             }
         };

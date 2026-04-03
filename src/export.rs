@@ -6,9 +6,11 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+#[allow(dead_code)]
 pub struct CsvExporter;
 
 #[derive(Debug, serde::Serialize)]
+#[allow(dead_code)]
 struct CsvRecord {
     chain: String,
     address: String,
@@ -20,6 +22,7 @@ struct CsvRecord {
     error_message: String,
 }
 
+#[allow(dead_code)]
 impl CsvExporter {
     pub fn new() -> Self {
         Self
